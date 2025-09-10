@@ -36,12 +36,8 @@ inline void WaitForStart(const std::atomic<bool>& start_flag) {
   while (!start_flag.load(std::memory_order_acquire)) { CpuRelax(); }
 }
 
-// Balance instruction mix without changing coherence:
-// - kTwoLines=true  : use mailbox.line1 (shared, adds coherence).
-// - kTwoLines=false : use thread-local 64B buffer (no coherence).
 template <bool kTwoLines>
 struct BalancedLine {
-  // thread-local 64B dummy line for the 1-line mode
   alignas(kCacheLineBytes) uint8_t local_line[kCacheLineBytes]{};
 
   inline void Mutate(Mailbox* mailbox, uint64_t seed) {
@@ -73,7 +69,8 @@ void WarmupReceive(const MeasureConfig& config,
   for (int i = 0; i < config.warmup; ++i) {
     while (mailbox->seq.load(std::memory_order_acquire) == *last_seq) { CpuRelax(); }
     *last_seq = mailbox->seq.load(std::memory_order_relaxed);
-    bal->Touch(mailbox);
+    (void)ReadTimestamp(mailbox);
+    if constexpr (kTwoLines) { bal->Touch(mailbox); }
     mailbox->ack.store(*last_seq, std::memory_order_release);
   }
 }
@@ -88,9 +85,9 @@ void TimedReceive(const MeasureConfig& config,
     while (mailbox->seq.load(std::memory_order_acquire) == *last_seq) { CpuRelax(); }
     *last_seq = mailbox->seq.load(std::memory_order_relaxed);
 
-    const uint64_t ts_recv = Rdtc();
     const uint64_t ts_send = ReadTimestamp(mailbox);
-    bal->Touch(mailbox);
+    if constexpr (kTwoLines) { bal->Touch(mailbox); }
+    const uint64_t ts_recv = Rdtc();
 
     samples_ns->push_back(static_cast<double>(ts_recv - ts_send) / config.cycles_per_ns);
     mailbox->ack.store(*last_seq, std::memory_order_release);
@@ -106,7 +103,6 @@ void WarmupSend(const MeasureConfig& config,
     const uint64_t t = Rdtc();
     WriteTimestamp(mailbox, t);
     bal->Mutate(mailbox, t);
-
     const uint64_t cur = ++(*seq);
     mailbox->seq.store(cur, std::memory_order_release);
     while (mailbox->ack.load(std::memory_order_acquire) != cur) { CpuRelax(); }
@@ -122,7 +118,6 @@ void TimedSend(const MeasureConfig& config,
     const uint64_t t = Rdtc();
     WriteTimestamp(mailbox, t);
     bal->Mutate(mailbox, t);
-
     const uint64_t cur = ++(*seq);
     mailbox->seq.store(cur, std::memory_order_release);
     while (mailbox->ack.load(std::memory_order_acquire) != cur) { CpuRelax(); }
