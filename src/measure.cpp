@@ -79,7 +79,7 @@ void TimedReceiveLoop(const MeasureConfig& config,
     }
     *last_sequence_observed = mailbox->seq.load(std::memory_order_relaxed);
 
-    const uint64_t timestamp_receive = Rdtcs();
+    const uint64_t timestamp_receive = Rdtc();
     const uint64_t timestamp_send = ReadTimestamp(mailbox);
     MaybeTouchSecondLine<kTwoLines>(mailbox);
 
@@ -94,7 +94,7 @@ void TimedReceiveLoop(const MeasureConfig& config,
 template <bool kTwoLines>
 void WarmupSendLoop(const MeasureConfig& config, Mailbox* mailbox, uint64_t* sequence) {
   for (int warmup_iteration = 0; warmup_iteration < config.warmup; ++warmup_iteration) {
-    const uint64_t timestamp = Rdtcs();
+    const uint64_t timestamp = Rdtc();
     WriteTimestamp(mailbox, timestamp);
     MaybeMutateSecondLine<kTwoLines>(mailbox, timestamp);
 
@@ -110,7 +110,7 @@ void WarmupSendLoop(const MeasureConfig& config, Mailbox* mailbox, uint64_t* seq
 template <bool kTwoLines>
 void TimedSendLoop(const MeasureConfig& config, Mailbox* mailbox, uint64_t* sequence) {
   for (int iteration = 0; iteration < config.iters; ++iteration) {
-    const uint64_t timestamp = Rdtcs();
+    const uint64_t timestamp = Rdtc();
     WriteTimestamp(mailbox, timestamp);
     MaybeMutateSecondLine<kTwoLines>(mailbox, timestamp);
 
