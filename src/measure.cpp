@@ -125,7 +125,7 @@ void TimedSendLoop(const MeasureConfig& config, Mailbox* mailbox, uint64_t* sequ
 
 template <bool kTwoLines>
 PairResult MeasurePairImpl(int cpu_sender, int cpu_receiver, const MeasureConfig& config) {
-  alignas(128) Mailbox mailbox{};
+  alignas(2 * kCacheLineBytes) Mailbox mailbox{};
 
   std::atomic<bool> start_flag{false};
   std::vector<double> samples_nanoseconds;

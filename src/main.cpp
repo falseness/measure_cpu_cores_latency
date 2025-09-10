@@ -18,58 +18,58 @@ struct Args {
   int warmup = 5000;
   int socket = 0;
   bool csv = false;
-  double tsc_ghz = 0.0;  // manual override
+  double tsc_ghz = 0.0;
 };
 
 static Args ParseArgs(int argc, char** argv) {
-  Args a;
+  Args args;
   for (int i = 1; i < argc; ++i) {
-    const std::string s = argv[i];
-    if (s == "--csv") {
-      a.csv = true;
-    } else if (s == "--iters" && i + 1 < argc) {
-      a.iters = std::stoi(argv[++i]);
-    } else if (s == "--warmup" && i + 1 < argc) {
-      a.warmup = std::stoi(argv[++i]);
-    } else if (s == "--socket" && i + 1 < argc) {
-      a.socket = std::stoi(argv[++i]);
-    } else if (s == "--tsc-ghz" && i + 1 < argc) {
-      a.tsc_ghz = std::stod(argv[++i]);
+    const std::string token = argv[i];
+    if (token == "--csv") {
+      args.csv = true;
+    } else if (token == "--iters" && i + 1 < argc) {
+      args.iters = std::stoi(argv[++i]);
+    } else if (token == "--warmup" && i + 1 < argc) {
+      args.warmup = std::stoi(argv[++i]);
+    } else if (token == "--socket" && i + 1 < argc) {
+      args.socket = std::stoi(argv[++i]);
+    } else if (token == "--tsc-ghz" && i + 1 < argc) {
+      args.tsc_ghz = std::stod(argv[++i]);
     } else {
-      std::cerr << "Unknown arg: " << s << "\n";
+      std::cerr << "Unknown arg: " << token << "\n";
       std::exit(1);
     }
   }
-  return a;
+  return args;
 }
 
-static std::string FmtNum(double v, int precision = 1) {
+static std::string FormatNumber(double value, int precision = 1) {
   std::ostringstream oss;
   oss.setf(std::ios::fixed);
-  oss << std::setprecision(precision) << v;
+  oss << std::setprecision(precision) << value;
   return oss.str();
 }
 
 static void PrintMatrix(const std::string& title,
-                        const std::vector<int>& cpus,
-                        const std::vector<std::vector<double>>& m,
+                        const std::vector<int>& cpu_ids,
+                        const std::vector<std::vector<double>>& matrix,
                         bool csv) {
-  const std::size_t n = cpus.size();
+  const std::size_t n = cpu_ids.size();
   std::cout << "==== " << title << " ====\n";
 
   if (csv) {
     std::cout << "cpu/cpu";
     for (std::size_t j = 0; j < n; ++j) {
-      std::cout << "," << cpus[j];
+      std::cout << "," << cpu_ids[j];
     }
     std::cout << "\n";
     for (std::size_t i = 0; i < n; ++i) {
-      std::cout << cpus[i];
+      std::cout << cpu_ids[i];
       for (std::size_t j = 0; j < n; ++j) {
         if (i == j) {
           std::cout << ",";
         } else {
-          std::cout << "," << FmtNum(m[i][j]);
+          std::cout << "," << FormatNumber(matrix[i][j]);
         }
       }
       std::cout << "\n";
@@ -78,64 +78,70 @@ static void PrintMatrix(const std::string& title,
   }
 
   const int precision = 1;
-  const int pad = 1;
+  const int padding = 1;
 
-  std::size_t first_col_w = std::string("cpu").size();
-  for (int id : cpus) {
-    const auto w = std::to_string(id).size();
-    if (w > first_col_w) {
-      first_col_w = w;
+  std::size_t first_col_width = std::string("cpu").size();
+  for (int id : cpu_ids) {
+    const std::size_t w = std::to_string(id).size();
+    if (w > first_col_width) {
+      first_col_width = w;
     }
   }
 
-  std::vector<std::size_t> col_w(n, 0);
+  std::vector<std::size_t> col_width(n, 0);
   for (std::size_t j = 0; j < n; ++j) {
-    col_w[j] = std::to_string(cpus[j]).size();
+    col_width[j] = std::to_string(cpu_ids[j]).size();
     for (std::size_t i = 0; i < n; ++i) {
       std::size_t cell_w = 0;
       if (i == j) {
-        cell_w = 1;  // "-"
+        cell_w = 1;
       } else {
-        cell_w = FmtNum(m[i][j], precision).size();
+        cell_w = FormatNumber(matrix[i][j], precision).size();
       }
-      if (cell_w > col_w[j]) {
-        col_w[j] = cell_w;
+      if (cell_w > col_width[j]) {
+        col_width[j] = cell_w;
       }
     }
   }
 
-  std::cout << std::setw(static_cast<int>(first_col_w)) << "cpu" << std::string(pad, ' ');
+  // Header
+  std::cout << std::setw(static_cast<int>(first_col_width)) << "cpu" << std::string(padding, ' ');
   for (std::size_t j = 0; j < n; ++j) {
-    std::cout << std::setw(static_cast<int>(col_w[j])) << cpus[j];
+    std::cout << std::setw(static_cast<int>(col_width[j])) << cpu_ids[j];
     if (j + 1 != n) {
-      std::cout << std::string(pad, ' ');
+      std::cout << std::string(padding, ' ');
     }
   }
   std::cout << "\n";
 
-  std::cout << std::string(first_col_w, '-') << std::string(pad, ' ');
+  // Separator
+  std::cout << std::string(first_col_width, '-') << std::string(padding, ' ');
   for (std::size_t j = 0; j < n; ++j) {
-    std::cout << std::string(col_w[j], '-');
+    std::cout << std::string(col_width[j], '-');
     if (j + 1 != n) {
-      std::cout << std::string(pad, ' ');
+      std::cout << std::string(padding, ' ');
     }
   }
   std::cout << "\n";
 
+  // Rows
   for (std::size_t i = 0; i < n; ++i) {
-    std::cout << std::setw(static_cast<int>(first_col_w)) << cpus[i] << std::string(pad, ' ');
+    std::cout << std::setw(static_cast<int>(first_col_width)) << cpu_ids[i]
+              << std::string(padding, ' ');
     for (std::size_t j = 0; j < n; ++j) {
       if (i == j) {
-        std::cout << std::setw(static_cast<int>(col_w[j])) << "-";
+        std::cout << std::setw(static_cast<int>(col_width[j])) << "-";
       } else {
-        std::cout << std::setw(static_cast<int>(col_w[j])) << FmtNum(m[i][j], precision);
+        std::cout << std::setw(static_cast<int>(col_width[j]))
+                  << FormatNumber(matrix[i][j], precision);
       }
       if (j + 1 != n) {
-        std::cout << std::string(pad, ' ');
+        std::cout << std::string(padding, ' ');
       }
     }
     std::cout << "\n";
   }
+  std::cout << "\n";
 }
 
 static void RunMode(const std::string& title,
@@ -144,76 +150,84 @@ static void RunMode(const std::string& title,
                     const std::vector<int>& used,
                     double cycles_per_ns) {
   const std::size_t n = used.size();
-  std::vector<std::vector<double>> med(n, std::vector<double>(n, NAN));
+  std::vector<std::vector<double>> median(n, std::vector<double>(n, NAN));
   std::vector<std::vector<double>> p90(n, std::vector<double>(n, NAN));
   std::vector<std::vector<double>> p95(n, std::vector<double>(n, NAN));
 
-  MeasureConfig mc;
-  mc.iters = args.iters;
-  mc.warmup = args.warmup;
-  mc.two_lines = two_lines;
-  mc.cycles_per_ns = cycles_per_ns;
+  MeasureConfig config;
+  config.iters = args.iters;
+  config.warmup = args.warmup;
+  config.two_lines = two_lines;
+  config.cycles_per_ns = cycles_per_ns;
 
   for (std::size_t i = 0; i < n; ++i) {
     for (std::size_t j = 0; j < n; ++j) {
       if (i == j) {
         continue;
       }
-      const PairResult r = MeasurePair(used[i], used[j], mc);
-      med[i][j] = r.median_ns;
-      p90[i][j] = r.p90_ns;
-      p95[i][j] = r.p95_ns;
-      std::cerr << (two_lines ? "[128B] " : "[64B] ")
-                << used[i] << "->" << used[j]
-                << " med=" << r.median_ns
-                << " p90=" << r.p90_ns
-                << " p95=" << r.p95_ns << " ns\n";
+      const PairResult result = MeasurePair(used[i], used[j], config);
+      median[i][j] = result.median_ns;
+      p90[i][j] = result.p90_ns;
+      p95[i][j] = result.p95_ns;
+
+      // std::cerr << (two_lines ? "[128B] " : "[64B] ")
+      //           << used[i] << "->" << used[j]
+      //           << " med=" << FormatNumber(result.median_ns)
+      //           << " p90=" << FormatNumber(result.p90_ns)
+      //           << " p95=" << FormatNumber(result.p95_ns) << " ns\n";
     }
   }
 
-  PrintMatrix(title + " (median)", used, med, args.csv);
+  PrintMatrix(title + " (median)", used, median, args.csv);
   PrintMatrix(title + " (p90)", used, p90, args.csv);
   PrintMatrix(title + " (p95)", used, p95, args.csv);
+}
+
+static double DetermineCyclesPerNs(const Args& args) {
+  if (args.tsc_ghz > 0.0) {
+    const double cycles_per_ns = args.tsc_ghz;
+    std::cout << "TSC ~ " << (cycles_per_ns * 1e3) << " MHz (manual)\n";
+    return cycles_per_ns;
+  }
+
+  auto tsc_hz = GetTscHzFromCpuid();
+  if (!tsc_hz || *tsc_hz == 0) {
+    tsc_hz = GetTscHzFromSysfs();
+  }
+  if (!tsc_hz || *tsc_hz == 0) {
+    std::cerr << "Failed to obtain TSC frequency. Provide --tsc-ghz <GHz>.\n";
+    std::exit(1);
+  }
+
+  const double cycles_per_ns = static_cast<double>(*tsc_hz) / 1e9;
+  std::cout << "TSC ~ " << (cycles_per_ns * 1e3)
+            << " MHz" << (GetTscHzFromCpuid() ? " (CPUID)" : " (sysfs)") << "\n";
+  return cycles_per_ns;
+}
+
+static void RunBenchmark(const Args& args) {
+  const double cycles_per_ns = DetermineCyclesPerNs(args);
+
+  const auto infos = GetOneThreadPerCoreSameSocket(args.socket);
+  if (infos.size() < 2) {
+    std::cerr << "Need >=2 cores on socket " << args.socket << "\n";
+    std::exit(1);
+  }
+
+  std::vector<int> used;
+  used.reserve(infos.size());
+  for (const auto& info : infos) {
+    used.push_back(info.cpu);
+  }
+
+  RunMode("1 cache line", /*two_lines=*/false, args, used, cycles_per_ns);
+  RunMode("2 cache lines", /*two_lines=*/true, args, used, cycles_per_ns);
 }
 
 }  // namespace icore
 
 int main(int argc, char** argv) {
-  using namespace icore;
-
-  const Args args = ParseArgs(argc, argv);
-
-  double cycles_per_ns = 0.0;
-  if (args.tsc_ghz > 0.0) {
-    cycles_per_ns = args.tsc_ghz;
-    std::cerr << "TSC ~ " << (cycles_per_ns * 1e3) << " MHz (manual)\n";
-  } else {
-    auto hz = GetTscHzFromCpuid();
-    if (!hz || *hz == 0) {
-      hz = GetTscHzFromSysfs();
-    }
-    if (!hz || *hz == 0) {
-      std::cerr << "Failed to obtain TSC frequency. Provide --tsc-ghz <GHz>.\n";
-      return 1;
-    }
-    cycles_per_ns = static_cast<double>(*hz) / 1e9;
-    std::cerr << "TSC ~ " << (cycles_per_ns * 1e3) << " MHz"
-              << (GetTscHzFromCpuid() ? " (CPUID)" : " (sysfs)") << "\n";
-  }
-
-  const auto infos = GetOneThreadPerCoreSameSocket(args.socket);
-  if (infos.size() < 2) {
-    std::cerr << "Need >=2 cores on socket " << args.socket << "\n";
-    return 1;
-  }
-
-  std::vector<int> used;
-  used.reserve(infos.size());
-  for (const auto& c : infos) {
-    used.push_back(c.cpu);
-  }
-
-  RunMode("1 cache line", /*two_lines=*/false, args, used, cycles_per_ns);
-  RunMode("2 cache lines", /*two_lines=*/true, args, used, cycles_per_ns);
+  const icore::Args args = icore::ParseArgs(argc, argv);
+  icore::RunBenchmark(args);
   return 0;
 }
