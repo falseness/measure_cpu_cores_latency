@@ -15,16 +15,14 @@ namespace icore {
 namespace {
 
 double PickQuantile(std::vector<double>* values, double quantile) {
-  if (values->empty()) {
-    return NAN;
-  }
-  const std::size_t count = values->size();
-  const std::size_t index =
-      static_cast<std::size_t>(std::floor(quantile * static_cast<double>(count - 1)));
+  if (values->empty()) { return NAN; }
+  const std::size_t n = values->size();
+  const std::size_t idx =
+      static_cast<std::size_t>(std::floor(quantile * static_cast<double>(n - 1)));
   std::nth_element(values->begin(),
-                   values->begin() + static_cast<std::ptrdiff_t>(index),
+                   values->begin() + static_cast<std::ptrdiff_t>(idx),
                    values->end());
-  return (*values)[index];
+  return (*values)[idx];
 }
 
 void PinOrTerminate(int cpu_id, const char* role) {
@@ -34,111 +32,121 @@ void PinOrTerminate(int cpu_id, const char* role) {
   }
 }
 
-template <bool kTwoLines>
-inline void MaybeTouchSecondLine(const Mailbox* mailbox) {
-  if constexpr (kTwoLines) {
-    TouchSecondLine(mailbox);
-  }
+inline void WaitForStart(const std::atomic<bool>& start_flag) {
+  while (!start_flag.load(std::memory_order_acquire)) { CpuRelax(); }
 }
 
+// Balance instruction mix without changing coherence:
+// - kTwoLines=true  : use mailbox.line1 (shared, adds coherence).
+// - kTwoLines=false : use thread-local 64B buffer (no coherence).
 template <bool kTwoLines>
-inline void MaybeMutateSecondLine(Mailbox* mailbox, uint64_t seed) {
-  if constexpr (kTwoLines) {
-    MutateSecondLine(mailbox, seed);
-  }
-}
+struct BalancedLine {
+  // thread-local 64B dummy line for the 1-line mode
+  alignas(kCacheLineBytes) uint8_t local_line[kCacheLineBytes]{};
 
-void WaitForStart(const std::atomic<bool>& start_flag) {
-  while (!start_flag.load(std::memory_order_acquire)) {
-    CpuRelax();
-  }
-}
-
-template <bool kTwoLines>
-void WarmupReceiveLoop(const MeasureConfig& config,
-                       Mailbox* mailbox,
-                       uint64_t* last_sequence_observed) {
-  for (int warmup_iteration = 0; warmup_iteration < config.warmup; ++warmup_iteration) {
-    while (mailbox->seq.load(std::memory_order_acquire) == *last_sequence_observed) {
-      CpuRelax();
-    }
-    *last_sequence_observed = mailbox->seq.load(std::memory_order_relaxed);
-    MaybeTouchSecondLine<kTwoLines>(mailbox);
-    mailbox->ack.store(*last_sequence_observed, std::memory_order_release);
-  }
-}
-
-template <bool kTwoLines>
-void TimedReceiveLoop(const MeasureConfig& config,
-                      Mailbox* mailbox,
-                      uint64_t* last_sequence_observed,
-                      std::vector<double>* samples_nanoseconds) {
-  for (int iteration = 0; iteration < config.iters; ++iteration) {
-    while (mailbox->seq.load(std::memory_order_acquire) == *last_sequence_observed) {
-      CpuRelax();
-    }
-    *last_sequence_observed = mailbox->seq.load(std::memory_order_relaxed);
-
-    const uint64_t timestamp_receive = Rdtc();
-    const uint64_t timestamp_send = ReadTimestamp(mailbox);
-    MaybeTouchSecondLine<kTwoLines>(mailbox);
-
-    const double delta_nanoseconds =
-        static_cast<double>(timestamp_receive - timestamp_send) / config.cycles_per_ns;
-    samples_nanoseconds->push_back(delta_nanoseconds);
-
-    mailbox->ack.store(*last_sequence_observed, std::memory_order_release);
-  }
-}
-
-template <bool kTwoLines>
-void WarmupSendLoop(const MeasureConfig& config, Mailbox* mailbox, uint64_t* sequence) {
-  for (int warmup_iteration = 0; warmup_iteration < config.warmup; ++warmup_iteration) {
-    const uint64_t timestamp = Rdtc();
-    WriteTimestamp(mailbox, timestamp);
-    MaybeMutateSecondLine<kTwoLines>(mailbox, timestamp);
-
-    const uint64_t current_sequence = ++(*sequence);
-    mailbox->seq.store(current_sequence, std::memory_order_release);
-
-    while (mailbox->ack.load(std::memory_order_acquire) != current_sequence) {
-      CpuRelax();
+  inline void Mutate(Mailbox* mailbox, uint64_t seed) {
+    if constexpr (kTwoLines) {
+      MutateSecondLine(mailbox, seed);
+    } else {
+      auto* q = reinterpret_cast<uint64_t*>(local_line);
+      for (std::size_t i = 0; i < kQwordsPerLine; ++i) { q[i] = seed + static_cast<uint64_t>(i); }
     }
   }
+
+  inline void Touch(const Mailbox* mailbox) {
+    if constexpr (kTwoLines) {
+      TouchSecondLine(mailbox);
+    } else {
+      volatile const uint64_t* q = reinterpret_cast<const uint64_t*>(local_line);
+      uint64_t sink = 0;
+      for (std::size_t i = 0; i < kQwordsPerLine; ++i) { sink ^= q[i]; }
+      asm volatile("" :: "r"(sink));
+    }
+  }
+};
+
+template <bool kTwoLines>
+void WarmupReceive(const MeasureConfig& config,
+                   Mailbox* mailbox,
+                   uint64_t* last_seq,
+                   BalancedLine<kTwoLines>* bal) {
+  for (int i = 0; i < config.warmup; ++i) {
+    while (mailbox->seq.load(std::memory_order_acquire) == *last_seq) { CpuRelax(); }
+    *last_seq = mailbox->seq.load(std::memory_order_relaxed);
+    bal->Touch(mailbox);
+    mailbox->ack.store(*last_seq, std::memory_order_release);
+  }
 }
 
 template <bool kTwoLines>
-void TimedSendLoop(const MeasureConfig& config, Mailbox* mailbox, uint64_t* sequence) {
-  for (int iteration = 0; iteration < config.iters; ++iteration) {
-    const uint64_t timestamp = Rdtc();
-    WriteTimestamp(mailbox, timestamp);
-    MaybeMutateSecondLine<kTwoLines>(mailbox, timestamp);
+void TimedReceive(const MeasureConfig& config,
+                  Mailbox* mailbox,
+                  uint64_t* last_seq,
+                  BalancedLine<kTwoLines>* bal,
+                  std::vector<double>* samples_ns) {
+  for (int i = 0; i < config.iters; ++i) {
+    while (mailbox->seq.load(std::memory_order_acquire) == *last_seq) { CpuRelax(); }
+    *last_seq = mailbox->seq.load(std::memory_order_relaxed);
 
-    const uint64_t current_sequence = ++(*sequence);
-    mailbox->seq.store(current_sequence, std::memory_order_release);
+    const uint64_t ts_recv = Rdtc();
+    const uint64_t ts_send = ReadTimestamp(mailbox);
+    bal->Touch(mailbox);
 
-    while (mailbox->ack.load(std::memory_order_acquire) != current_sequence) {
-      CpuRelax();
-    }
+    samples_ns->push_back(static_cast<double>(ts_recv - ts_send) / config.cycles_per_ns);
+    mailbox->ack.store(*last_seq, std::memory_order_release);
+  }
+}
+
+template <bool kTwoLines>
+void WarmupSend(const MeasureConfig& config,
+                Mailbox* mailbox,
+                uint64_t* seq,
+                BalancedLine<kTwoLines>* bal) {
+  for (int i = 0; i < config.warmup; ++i) {
+    const uint64_t t = Rdtc();
+    WriteTimestamp(mailbox, t);
+    bal->Mutate(mailbox, t);
+
+    const uint64_t cur = ++(*seq);
+    mailbox->seq.store(cur, std::memory_order_release);
+    while (mailbox->ack.load(std::memory_order_acquire) != cur) { CpuRelax(); }
+  }
+}
+
+template <bool kTwoLines>
+void TimedSend(const MeasureConfig& config,
+               Mailbox* mailbox,
+               uint64_t* seq,
+               BalancedLine<kTwoLines>* bal) {
+  for (int i = 0; i < config.iters; ++i) {
+    const uint64_t t = Rdtc();
+    WriteTimestamp(mailbox, t);
+    bal->Mutate(mailbox, t);
+
+    const uint64_t cur = ++(*seq);
+    mailbox->seq.store(cur, std::memory_order_release);
+    while (mailbox->ack.load(std::memory_order_acquire) != cur) { CpuRelax(); }
   }
 }
 
 template <bool kTwoLines>
 PairResult MeasurePairImpl(int cpu_sender, int cpu_receiver, const MeasureConfig& config) {
-  alignas(2 * kCacheLineBytes) Mailbox mailbox{};
-
+  alignas(kMailboxAlignBytes) Mailbox mailbox{};
   std::atomic<bool> start_flag{false};
-  std::vector<double> samples_nanoseconds;
-  samples_nanoseconds.reserve(static_cast<std::size_t>(config.iters));
+  std::vector<double> samples_ns;
+  samples_ns.reserve(static_cast<std::size_t>(config.iters));
+
+  BalancedLine<kTwoLines> sender_line;
+  BalancedLine<kTwoLines> receiver_line;
 
   std::thread receiver_thread([&] {
     PinOrTerminate(cpu_receiver, "receiver");
     TryHardRealtime();
     WaitForStart(start_flag);
 
-    uint64_t last_sequence_observed = 0;
-    WarmupReceiveLoop<kTwoLines>(config, &mailbox, &last_sequence_observed);
-    TimedReceiveLoop<kTwoLines>(config, &mailbox, &last_sequence_observed, &samples_nanoseconds);
+    uint64_t last_seq = 0;
+    WarmupReceive<kTwoLines>(config, &mailbox, &last_seq, &receiver_line);
+    TimedReceive<kTwoLines>(config, &mailbox, &last_seq, &receiver_line, &samples_ns);
   });
 
   PinOrTerminate(cpu_sender, "sender");
@@ -146,19 +154,18 @@ PairResult MeasurePairImpl(int cpu_sender, int cpu_receiver, const MeasureConfig
 
   start_flag.store(true, std::memory_order_release);
 
-  uint64_t sequence = 0;
-  WarmupSendLoop<kTwoLines>(config, &mailbox, &sequence);
-  TimedSendLoop<kTwoLines>(config, &mailbox, &sequence);
+  uint64_t seq = 0;
+  WarmupSend<kTwoLines>(config, &mailbox, &seq, &sender_line);
+  TimedSend<kTwoLines>(config, &mailbox, &seq, &sender_line);
 
   receiver_thread.join();
 
-  std::sort(samples_nanoseconds.begin(), samples_nanoseconds.end());
-
-  PairResult result;
-  result.median_ns = PickQuantile(&samples_nanoseconds, 0.50);
-  result.p90_ns = PickQuantile(&samples_nanoseconds, 0.90);
-  result.p95_ns = PickQuantile(&samples_nanoseconds, 0.95);
-  return result;
+  std::sort(samples_ns.begin(), samples_ns.end());
+  PairResult out;
+  out.median_ns = PickQuantile(&samples_ns, 0.50);
+  out.p90_ns = PickQuantile(&samples_ns, 0.90);
+  out.p95_ns = PickQuantile(&samples_ns, 0.95);
+  return out;
 }
 
 }  // namespace
