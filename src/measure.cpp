@@ -43,7 +43,7 @@ void TimedReceive(size_t iters_count,
                   uint64_t* last_seq,
                   std::vector<double>* samples_ns) {
   for (int i = 0; i < iters_count; ++i) {
-    while (mailbox->seq.load(std::memory_order_acquire) == *last_seq) { CpuRelax(); }
+    while (mailbox->seq.load(std::memory_order_acquire) == *last_seq) { }
     *last_seq = mailbox->seq.load(std::memory_order_relaxed);
 
     const uint64_t ts_send = ReadTimestampAndFirstLine(mailbox);
@@ -69,7 +69,7 @@ void TimedSend(size_t iters_count,
     }
     const uint64_t cur = ++(*seq);
     mailbox->seq.store(cur, std::memory_order_release);
-    while (mailbox->ack.load(std::memory_order_acquire) != cur) { CpuRelax(); }
+    while (mailbox->ack.load(std::memory_order_acquire) != cur) { }
   }
 }
 
