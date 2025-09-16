@@ -86,7 +86,7 @@ void TimedReceive(const MeasureConfig& config,
     *last_seq = mailbox->seq.load(std::memory_order_relaxed);
 
     const uint64_t ts_send = ReadTimestamp(mailbox);
-    if constexpr (kTwoLines) { bal->Touch(mailbox); }
+    if constexpr (kTwoLines) { TouchSecondLine(mailbox); }
     const uint64_t ts_recv = Rdtc();
 
     samples_ns->push_back(static_cast<double>(ts_recv - ts_send) / config.cycles_per_ns);
@@ -117,7 +117,9 @@ void TimedSend(const MeasureConfig& config,
   for (int i = 0; i < config.iters; ++i) {
     const uint64_t t = Rdtc();
     WriteTimestamp(mailbox, t);
-    bal->Mutate(mailbox, t);
+    if constexpr (kTwoLines) {
+      MutateSecondLine(mailbox, i);
+    }
     const uint64_t cur = ++(*seq);
     mailbox->seq.store(cur, std::memory_order_release);
     while (mailbox->ack.load(std::memory_order_acquire) != cur) { CpuRelax(); }
