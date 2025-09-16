@@ -37,90 +37,39 @@ inline void WaitForStart(const std::atomic<bool>& start_flag) {
 }
 
 template <bool kTwoLines>
-struct BalancedLine {
-  alignas(kCacheLineBytes) uint8_t local_line[kCacheLineBytes]{};
-
-  inline void Mutate(Mailbox* mailbox, uint64_t seed) {
-    if constexpr (kTwoLines) {
-      MutateSecondLine(mailbox, seed);
-    } else {
-      auto* q = reinterpret_cast<uint64_t*>(local_line);
-      for (std::size_t i = 0; i < kQwordsPerLine; ++i) { q[i] = seed + static_cast<uint64_t>(i); }
-    }
-  }
-
-  inline void Touch(const Mailbox* mailbox) {
-    if constexpr (kTwoLines) {
-      TouchSecondLine(mailbox);
-    } else {
-      volatile const uint64_t* q = reinterpret_cast<const uint64_t*>(local_line);
-      uint64_t sink = 0;
-      for (std::size_t i = 0; i < kQwordsPerLine; ++i) { sink ^= q[i]; }
-      asm volatile("" :: "r"(sink));
-    }
-  }
-};
-
-template <bool kTwoLines>
-void WarmupReceive(const MeasureConfig& config,
-                   Mailbox* mailbox,
-                   uint64_t* last_seq,
-                   BalancedLine<kTwoLines>* bal) {
-  for (int i = 0; i < config.warmup; ++i) {
-    while (mailbox->seq.load(std::memory_order_acquire) == *last_seq) { CpuRelax(); }
-    *last_seq = mailbox->seq.load(std::memory_order_relaxed);
-    (void)ReadTimestamp(mailbox);
-    if constexpr (kTwoLines) { bal->Touch(mailbox); }
-    mailbox->ack.store(*last_seq, std::memory_order_release);
-  }
-}
-
-template <bool kTwoLines>
-void TimedReceive(const MeasureConfig& config,
+void TimedReceive(size_t iters_count,
+                  double cycles_per_ns, 
                   Mailbox* mailbox,
                   uint64_t* last_seq,
-                  BalancedLine<kTwoLines>* bal,
                   std::vector<double>* samples_ns) {
-  for (int i = 0; i < config.iters; ++i) {
-    while (mailbox->seq.load(std::memory_order_acquire) == *last_seq) { CpuRelax(); }
+  for (int i = 0; i < iters_count; ++i) {
+    while (mailbox->seq.load(std::memory_order_acquire) == *last_seq) { }
     *last_seq = mailbox->seq.load(std::memory_order_relaxed);
 
-    const uint64_t ts_send = ReadTimestamp(mailbox);
-    if constexpr (kTwoLines) { bal->Touch(mailbox); }
+    const uint64_t ts_send = ReadTimestampAndFirstLine(mailbox);
+    if constexpr (kTwoLines) { ReadSecondLine(mailbox); }
     const uint64_t ts_recv = Rdtc();
 
-    samples_ns->push_back(static_cast<double>(ts_recv - ts_send) / config.cycles_per_ns);
+    samples_ns->push_back(static_cast<double>(ts_recv - ts_send) / cycles_per_ns);
     mailbox->ack.store(*last_seq, std::memory_order_release);
   }
 }
 
 template <bool kTwoLines>
-void WarmupSend(const MeasureConfig& config,
-                Mailbox* mailbox,
-                uint64_t* seq,
-                BalancedLine<kTwoLines>* bal) {
-  for (int i = 0; i < config.warmup; ++i) {
-    const uint64_t t = Rdtc();
-    WriteTimestamp(mailbox, t);
-    bal->Mutate(mailbox, t);
-    const uint64_t cur = ++(*seq);
-    mailbox->seq.store(cur, std::memory_order_release);
-    while (mailbox->ack.load(std::memory_order_acquire) != cur) { CpuRelax(); }
-  }
-}
-
-template <bool kTwoLines>
-void TimedSend(const MeasureConfig& config,
+void TimedSend(size_t iters_count,
                Mailbox* mailbox,
-               uint64_t* seq,
-               BalancedLine<kTwoLines>* bal) {
-  for (int i = 0; i < config.iters; ++i) {
+               uint64_t* seq) {
+  for (size_t i = 0; i < iters_count; ++i) {
+    unsigned char seed1 = rand();
+    unsigned char seed2 = rand();
     const uint64_t t = Rdtc();
-    WriteTimestamp(mailbox, t);
-    bal->Mutate(mailbox, t);
+    WriteTimestampAndFirstLine(mailbox, t, seed1);
+    if constexpr (kTwoLines) {
+      WriteSecondLine(mailbox, seed2);
+    }
     const uint64_t cur = ++(*seq);
     mailbox->seq.store(cur, std::memory_order_release);
-    while (mailbox->ack.load(std::memory_order_acquire) != cur) { CpuRelax(); }
+    while (mailbox->ack.load(std::memory_order_acquire) != cur) { }
   }
 }
 
@@ -131,17 +80,16 @@ PairResult MeasurePairImpl(int cpu_sender, int cpu_receiver, const MeasureConfig
   std::vector<double> samples_ns;
   samples_ns.reserve(static_cast<std::size_t>(config.iters));
 
-  BalancedLine<kTwoLines> sender_line;
-  BalancedLine<kTwoLines> receiver_line;
-
+  static constexpr size_t kWarmupItersCount = 100;
   std::thread receiver_thread([&] {
     PinOrTerminate(cpu_receiver, "receiver");
     TryHardRealtime();
     WaitForStart(start_flag);
 
     uint64_t last_seq = 0;
-    WarmupReceive<kTwoLines>(config, &mailbox, &last_seq, &receiver_line);
-    TimedReceive<kTwoLines>(config, &mailbox, &last_seq, &receiver_line, &samples_ns);
+    std::vector<double> warmup_samples_ns;
+    TimedReceive<kTwoLines>(kWarmupItersCount, config.cycles_per_ns, &mailbox, &last_seq, &warmup_samples_ns);
+    TimedReceive<kTwoLines>(config.iters, config.cycles_per_ns, &mailbox, &last_seq, &samples_ns);
   });
 
   PinOrTerminate(cpu_sender, "sender");
@@ -150,8 +98,8 @@ PairResult MeasurePairImpl(int cpu_sender, int cpu_receiver, const MeasureConfig
   start_flag.store(true, std::memory_order_release);
 
   uint64_t seq = 0;
-  WarmupSend<kTwoLines>(config, &mailbox, &seq, &sender_line);
-  TimedSend<kTwoLines>(config, &mailbox, &seq, &sender_line);
+  TimedSend<kTwoLines>(kWarmupItersCount, &mailbox, &seq);
+  TimedSend<kTwoLines>(config.iters, &mailbox, &seq);
 
   receiver_thread.join();
 
