@@ -46,8 +46,8 @@ void TimedReceive(size_t iters_count,
     while (mailbox->seq.load(std::memory_order_acquire) == *last_seq) { CpuRelax(); }
     *last_seq = mailbox->seq.load(std::memory_order_relaxed);
 
-    const uint64_t ts_send = ReadTimestamp(mailbox);
-    if constexpr (kTwoLines) { TouchSecondLine(mailbox); }
+    const uint64_t ts_send = ReadTimestampAndFirstLine(mailbox);
+    if constexpr (kTwoLines) { ReadSecondLine(mailbox); }
     const uint64_t ts_recv = Rdtc();
 
     samples_ns->push_back(static_cast<double>(ts_recv - ts_send) / cycles_per_ns);
@@ -59,11 +59,13 @@ template <bool kTwoLines>
 void TimedSend(size_t iters_count,
                Mailbox* mailbox,
                uint64_t* seq) {
-  for (int i = 0; i < iters_count; ++i) {
+  for (size_t i = 0; i < iters_count; ++i) {
+    unsigned char seed1 = rand();
+    unsigned char seed2 = rand();
     const uint64_t t = Rdtc();
-    WriteTimestamp(mailbox, t);
+    WriteTimestampAndFirstLine(mailbox, t, seed1);
     if constexpr (kTwoLines) {
-      MutateSecondLine(mailbox, i);
+      WriteSecondLine(mailbox, seed2);
     }
     const uint64_t cur = ++(*seq);
     mailbox->seq.store(cur, std::memory_order_release);

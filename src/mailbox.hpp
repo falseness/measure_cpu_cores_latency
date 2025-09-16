@@ -18,28 +18,34 @@ struct alignas(kMailboxAlignBytes) Mailbox {
   alignas(kCacheLineBytes) unsigned char line1[kCacheLineBytes];
 };
 
-inline void WriteTimestamp(Mailbox* mailbox, uint64_t tsc) {
+inline void WriteTimestampAndFirstLine(Mailbox* mailbox, uint64_t tsc, uint64_t seed) {
   std::memcpy(mailbox->line0, &tsc, sizeof(tsc));
-}
-
-inline uint64_t ReadTimestamp(const Mailbox* mailbox) {
-  uint64_t tsc = 0;
-  std::memcpy(&tsc, mailbox->line0, sizeof(tsc));
-  return tsc;
-}
-
-inline void MutateSecondLine(Mailbox* mailbox, uint64_t seed) {
-  auto* q = reinterpret_cast<uint64_t*>(mailbox->line1);
-  for (std::size_t i = 0; i < kQwordsPerLine; ++i) {
-    q[i] = seed + static_cast<uint64_t>(i);
+  for (std::size_t i = sizeof(tsc); i < kCacheLineBytes; ++i) {
+    mailbox->line0[i] = seed + i;
   }
 }
 
-inline void TouchSecondLine(const Mailbox* mailbox) {
-  const volatile uint64_t* q = reinterpret_cast<const volatile uint64_t*>(mailbox->line1);
+inline uint64_t ReadTimestampAndFirstLine(const Mailbox* mailbox) {
+  uint64_t tsc = 0;
+  std::memcpy(&tsc, mailbox->line0, sizeof(tsc));
   uint64_t sink = 0;
-  for (std::size_t i = 0; i < kQwordsPerLine; ++i) {
-    sink ^= q[i];
+  for (size_t i = sizeof(tsc); i < kCacheLineBytes; ++i) {
+    sink += mailbox->line0[i];
+  }
+  asm volatile("" :: "r"(sink));
+  return tsc;
+}
+
+inline void WriteSecondLine(Mailbox* mailbox, unsigned char seed) {
+  for (size_t i = 0; i < kCacheLineBytes; ++i) {
+    mailbox->line1[i] = seed + i;
+  }
+}
+
+inline void ReadSecondLine(const Mailbox* mailbox) {
+  uint64_t sink = 0;
+  for (size_t i = 0; i < kCacheLineBytes; ++i) {
+    sink += mailbox->line1[i];
   }
   asm volatile("" :: "r"(sink));
 }
