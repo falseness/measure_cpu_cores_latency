@@ -37,40 +37,13 @@ inline void WaitForStart(const std::atomic<bool>& start_flag) {
 }
 
 template <bool kTwoLines>
-struct BalancedLine {
-  alignas(kCacheLineBytes) uint8_t local_line[kCacheLineBytes]{};
-
-  inline void Mutate(Mailbox* mailbox, uint64_t seed) {
-    if constexpr (kTwoLines) {
-      MutateSecondLine(mailbox, seed);
-    } else {
-      auto* q = reinterpret_cast<uint64_t*>(local_line);
-      for (std::size_t i = 0; i < kQwordsPerLine; ++i) { q[i] = seed + static_cast<uint64_t>(i); }
-    }
-  }
-
-  inline void Touch(const Mailbox* mailbox) {
-    if constexpr (kTwoLines) {
-      TouchSecondLine(mailbox);
-    } else {
-      volatile const uint64_t* q = reinterpret_cast<const uint64_t*>(local_line);
-      uint64_t sink = 0;
-      for (std::size_t i = 0; i < kQwordsPerLine; ++i) { sink ^= q[i]; }
-      asm volatile("" :: "r"(sink));
-    }
-  }
-};
-
-template <bool kTwoLines>
 void WarmupReceive(const MeasureConfig& config,
                    Mailbox* mailbox,
-                   uint64_t* last_seq,
-                   BalancedLine<kTwoLines>* bal) {
+                   uint64_t* last_seq) {
   for (int i = 0; i < config.warmup; ++i) {
     while (mailbox->seq.load(std::memory_order_acquire) == *last_seq) { CpuRelax(); }
     *last_seq = mailbox->seq.load(std::memory_order_relaxed);
     (void)ReadTimestamp(mailbox);
-    if constexpr (kTwoLines) { bal->Touch(mailbox); }
     mailbox->ack.store(*last_seq, std::memory_order_release);
   }
 }
@@ -79,7 +52,6 @@ template <bool kTwoLines>
 void TimedReceive(const MeasureConfig& config,
                   Mailbox* mailbox,
                   uint64_t* last_seq,
-                  BalancedLine<kTwoLines>* bal,
                   std::vector<double>* samples_ns) {
   for (int i = 0; i < config.iters; ++i) {
     while (mailbox->seq.load(std::memory_order_acquire) == *last_seq) { CpuRelax(); }
@@ -97,12 +69,10 @@ void TimedReceive(const MeasureConfig& config,
 template <bool kTwoLines>
 void WarmupSend(const MeasureConfig& config,
                 Mailbox* mailbox,
-                uint64_t* seq,
-                BalancedLine<kTwoLines>* bal) {
+                uint64_t* seq) {
   for (int i = 0; i < config.warmup; ++i) {
     const uint64_t t = Rdtc();
     WriteTimestamp(mailbox, t);
-    bal->Mutate(mailbox, t);
     const uint64_t cur = ++(*seq);
     mailbox->seq.store(cur, std::memory_order_release);
     while (mailbox->ack.load(std::memory_order_acquire) != cur) { CpuRelax(); }
@@ -112,8 +82,7 @@ void WarmupSend(const MeasureConfig& config,
 template <bool kTwoLines>
 void TimedSend(const MeasureConfig& config,
                Mailbox* mailbox,
-               uint64_t* seq,
-               BalancedLine<kTwoLines>* bal) {
+               uint64_t* seq) {
   for (int i = 0; i < config.iters; ++i) {
     const uint64_t t = Rdtc();
     WriteTimestamp(mailbox, t);
@@ -133,17 +102,14 @@ PairResult MeasurePairImpl(int cpu_sender, int cpu_receiver, const MeasureConfig
   std::vector<double> samples_ns;
   samples_ns.reserve(static_cast<std::size_t>(config.iters));
 
-  BalancedLine<kTwoLines> sender_line;
-  BalancedLine<kTwoLines> receiver_line;
-
   std::thread receiver_thread([&] {
     PinOrTerminate(cpu_receiver, "receiver");
     TryHardRealtime();
     WaitForStart(start_flag);
 
     uint64_t last_seq = 0;
-    WarmupReceive<kTwoLines>(config, &mailbox, &last_seq, &receiver_line);
-    TimedReceive<kTwoLines>(config, &mailbox, &last_seq, &receiver_line, &samples_ns);
+    WarmupReceive<kTwoLines>(config, &mailbox, &last_seq);
+    TimedReceive<kTwoLines>(config, &mailbox, &last_seq, &samples_ns);
   });
 
   PinOrTerminate(cpu_sender, "sender");
@@ -152,8 +118,8 @@ PairResult MeasurePairImpl(int cpu_sender, int cpu_receiver, const MeasureConfig
   start_flag.store(true, std::memory_order_release);
 
   uint64_t seq = 0;
-  WarmupSend<kTwoLines>(config, &mailbox, &seq, &sender_line);
-  TimedSend<kTwoLines>(config, &mailbox, &seq, &sender_line);
+  WarmupSend<kTwoLines>(config, &mailbox, &seq);
+  TimedSend<kTwoLines>(config, &mailbox, &seq);
 
   receiver_thread.join();
 
